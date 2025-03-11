@@ -19,27 +19,68 @@ type Config struct {
 }
 
 type PRInfo struct {
-	Number       int
-	Author       string // Just the login name
-	AuthorID     int64  // The GitHub user ID
-	State        string
-	Comments     []GeneralPRComment
-	CodeComments []CodeComment
+	Number         int
+	Author         string // Just the login name
+	AuthorID       int64  // The GitHub user ID
+	State          string
+	CommentThreads map[int64]*CommentThread
 }
 
-type GeneralPRComment struct {
-	Commentor string
-	Body      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+type CommentThread struct {
+	RootComment CodeComment
+	Replies     []*CodeComment
+	// Sort replies chronologically
+	// ResponseTimes []time.Duration // Time between successive replies
 }
 
-// TODO: Can we combine GeneralPRComment and CodeComment?
 type CodeComment struct {
 	Commentor string
+	CommentID int64
+	InReplyTo int64
 	Body      string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+func findRootComment(comment *CodeComment, commentsByID map[int64]*CodeComment) int64 {
+	current := comment
+
+	// Keep following the reply chain until we find a root comment
+	for current.InReplyTo != 0 && commentsByID[current.InReplyTo] != nil {
+		current = commentsByID[current.InReplyTo]
+	}
+
+	// Return the ID of the root comment we found
+	return current.CommentID
+}
+
+func organizeThreads(comments []CodeComment) map[int64]*CommentThread {
+	threads := make(map[int64]*CommentThread)
+	commentsByID := make(map[int64]*CodeComment)
+
+	for i := range comments {
+		commentsByID[comments[i].CommentID] = &comments[i]
+	}
+
+	for i := range comments {
+		comment := &comments[i]
+
+		if comment.InReplyTo == 0 {
+			threads[comment.CommentID] = &CommentThread{
+				RootComment: *comment,
+				Replies:     []*CodeComment{},
+			}
+		} else {
+
+			rootID := findRootComment(comment, commentsByID)
+			if thread, exists := threads[rootID]; exists {
+				thread.Replies = append(thread.Replies, comment)
+			}
+
+		}
+	}
+
+	return threads
 }
 
 func run(ctx context.Context) error {
@@ -72,12 +113,11 @@ func run(ctx context.Context) error {
 	for _, pr := range prs {
 
 		prInfoMap[*pr.ID] = &PRInfo{
-			Number:       *pr.Number,
-			Author:       *pr.User.Login,
-			AuthorID:     *pr.User.ID,
-			State:        *pr.State,
-			Comments:     []GeneralPRComment{},
-			CodeComments: []CodeComment{},
+			Number:         *pr.Number,
+			Author:         *pr.User.Login,
+			AuthorID:       *pr.User.ID,
+			State:          *pr.State,
+			CommentThreads: make(map[int64]*CommentThread),
 		}
 
 		codeComments, _, err := githubClient.PullRequests.ListComments(ctx, config.GithubOwner, config.GithubRepo, *pr.Number, nil)
@@ -86,33 +126,45 @@ func run(ctx context.Context) error {
 			continue
 		}
 
+		// Create a slice to hold all comments for this PR
+		allComments := make([]CodeComment, 0, len(codeComments))
+
 		for _, comment := range codeComments {
-			prInfoMap[*pr.ID].CodeComments = append(prInfoMap[*pr.ID].CodeComments, CodeComment{
+			// In the scenario that the comment is the first comment, there will be no value associated with inReplyTo.
+			// As a result, we set the the first comment to be 0
+			var inReplyTo int64
+			if comment.InReplyTo != nil {
+				inReplyTo = *comment.InReplyTo
+			}
+			allComments = append(allComments, CodeComment{
 				Commentor: *comment.User.Login,
+				CommentID: *comment.ID,
+				InReplyTo: inReplyTo,
 				Body:      *comment.Body,
 				CreatedAt: *comment.CreatedAt,
 				UpdatedAt: *comment.UpdatedAt,
 			})
-		}
 
-		generalPRComments, _, err := githubClient.Issues.ListComments(ctx, config.GithubOwner, config.GithubRepo, *pr.Number, nil)
-
-		if err != nil {
-			fmt.Printf("Error listing general PR comments for PR %d: %v", *pr.Number, err)
-			continue
-		}
-
-		for _, comment := range generalPRComments {
-			prInfoMap[*pr.ID].Comments = append(prInfoMap[*pr.ID].Comments, GeneralPRComment{
-				Commentor: *comment.User.Login,
-				Body:      *comment.Body,
-				CreatedAt: *comment.CreatedAt,
-				UpdatedAt: *comment.UpdatedAt,
-			})
+			// Organize comments into threads
+			prInfoMap[*pr.ID].CommentThreads = organizeThreads(allComments)
 		}
 	}
 
-	fmt.Printf("General PR Comments: %+v\n", *prInfoMap[2383247533])
+	if pr, exists := prInfoMap[2383247533]; exists {
+		fmt.Printf("%+v\n", *pr)
+
+		// Print thread details
+		fmt.Println("\nComment Threads:")
+		for rootID, thread := range pr.CommentThreads {
+			fmt.Printf("Thread %d (Root: %s): %d replies\n",
+				rootID, thread.RootComment.Commentor, len(thread.Replies))
+
+			for i, reply := range thread.Replies {
+				fmt.Printf("  Reply %d: %s at %s\n",
+					i+1, reply.Commentor, reply.CreatedAt.Format(time.RFC3339))
+			}
+		}
+	}
 
 	return nil
 }
